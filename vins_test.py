@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-vins_test_v4_0_0.py
+vins_test.py
 
 VINS test monitor and automatic parameter tuner.
 
 Example:
-  python3 vins_test_v4_0_0.py -param td \
+  python3 vins_test.py -param td \
     --test-json test.json \
     --config ~/vinsmono_ws/src/VINS-Mono/config/euroc/euroc_config.yaml \
     --bag ~/bag/NeoIndra03/test/indoor/5/data.bag
 
-  python3 vins_test_v4_0_0.py -param acc_n \
+  python3 vins_test.py -param acc_n \
     --test-json test.json \
     --bag ~/bag/NeoIndra03/test/indoor/5/data.bag
 
@@ -49,6 +49,9 @@ import time
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 from collections import deque
+
+APP_NAME = "VINS Test"
+VERSION = "4.0.1"
 
 ROS_VERSION = 1 if "--ros1" in sys.argv else 2
 ROS_NODE = None
@@ -103,8 +106,6 @@ def shutdown_ros_node():
         if ROS_NODE is not None:
             ROS_NODE.destroy_node()
         rclpy.shutdown()
-
-VERSION = "4.0.0"
 
 DEFAULT_CONFIG = "~/vinsmono_ws/src/VINS-Mono/config/euroc/euroc_config.yaml"
 DEFAULT_LAUNCH_CMD = None
@@ -1269,8 +1270,43 @@ def run_standalone_test(args):
     print()
 
 
+def get_branch_name():
+    try:
+        branch = subprocess.run(
+            ["git", "branch", "--show-current"],
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        ).stdout.strip()
+        if branch:
+            return branch
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return os.environ.get("GIT_BRANCH", "unknown")
+
+
+def version_text():
+    return (
+        f"{APP_NAME}\n"
+        f"Version: {VERSION}\n"
+        f"Branch : {get_branch_name()}\n"
+        f"ROS    : ROS{ROS_VERSION}"
+    )
+
+
+class VersionAction(argparse.Action):
+    def __init__(self, option_strings, dest=argparse.SUPPRESS, default=argparse.SUPPRESS, **kwargs):
+        super().__init__(option_strings, dest, nargs=0, default=default, **kwargs)
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        parser.exit(message=version_text() + "\n")
+
+
 def parse_args():
     p = argparse.ArgumentParser()
+    p.add_argument("--version", action=VersionAction, help="show version information and exit")
     p.add_argument("-param", required=False, help="YAML parameter to tune now, for example: -param td or -param acc_n. Search settings are loaded from test.json")
     p.add_argument("-test", "--test", action="store_true", help="standalone VINS session test mode; does not launch VINS or play a bag")
     p.add_argument("--ros1", action="store_true", help="use ROS1; ROS2 is the default")
@@ -1324,7 +1360,6 @@ def parse_args():
 
 
 def main():
-    print("VERSION:", VERSION)
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
     args = parse_args()
@@ -1349,7 +1384,7 @@ def main():
     if args.fixpos_max_wait is None:
         args.fixpos_max_wait = 60.0
     if args.test:
-        init_ros_node(args, "vins_test_4_0_0")
+        init_ros_node(args, "vins_test")
         try:
             run_standalone_test(args)
         finally:

@@ -1,3 +1,8 @@
+Changes in 4.0.1:
+  - remove the version number from the script filename and ROS node name
+  - add --version output with application version, Git branch, and ROS version
+  - keep application name and version in APP_NAME and VERSION constants
+
 Changes in 4.0.0:
   - ROS2 is the default runtime
   - add --ros1 to use ROS1
