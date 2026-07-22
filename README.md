@@ -49,6 +49,8 @@ python3 vins_test.py --help
 python3 vins_test.py --test
 ```
 
+Під час запуску standalone-режим виводить поточну версію застосунку, вибраний варіант ROS і топіки одометрії та IMU.
+
 ROS2 використовується типово. Для ROS1 додайте `--ros1`:
 
 ```bash

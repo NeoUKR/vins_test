@@ -1,3 +1,6 @@
+Changes in 4.1.1:
+  - show the current application version when standalone test mode starts
+
 Changes in 4.1.0:
   - monitor total CPU and NVIDIA GPU utilization during each tuning trial
   - add minimum, maximum, and average CPU/GPU load to trial reports

@@ -51,7 +51,7 @@ from typing import List, Optional, Tuple
 from collections import deque
 
 APP_NAME = "VINS Test"
-VERSION = "4.1.0"
+VERSION = "4.1.1"
 
 ROS_VERSION = 1 if "--ros1" in sys.argv else 2
 ROS_NODE = None
@@ -1343,6 +1343,7 @@ def print_standalone_report(test_id, reason, start_pos, end_pos, start_time, end
 def run_standalone_test(args):
     global stop_requested
     print(f"VINS standalone test mode | ROS{ROS_VERSION}")
+    print(f"Version: {VERSION}")
     print(f"Odometry: {args.odom_topic}")
     print(f"IMU:      {args.imu_topic}")
     if args.fixpos_enabled:

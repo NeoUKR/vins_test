@@ -49,6 +49,8 @@ Start VINS and the camera and IMU data sources first. Then open another terminal
 python3 vins_test.py --test
 ```
 
+At startup, standalone mode displays the current application version, selected ROS variant, and the odometry and IMU topics.
+
 ROS2 is used by default. Add `--ros1` to use ROS1:
 
 ```bash
