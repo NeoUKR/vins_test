@@ -1,3 +1,9 @@
+Changes in 4.2.0:
+  - monitor RAM utilization from MemTotal and MemAvailable
+  - monitor Raspberry Pi CPU temperature through thermal zone or hwmon
+  - add RAM load, RAM used, and CPU temperature min/max/average to reports
+  - add RAM and CPU temperature metrics to CSV and repeated-trial aggregation
+
 Changes in 4.1.3:
   - calculate Raspberry Pi V3D GPU load from gpu_stats runtime deltas
   - discover the V3D gpu_stats file through bounded, symlink-safe sysfs paths

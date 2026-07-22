@@ -52,7 +52,7 @@ from typing import List, Optional, Tuple
 from collections import deque
 
 APP_NAME = "VINS Test"
-VERSION = "4.1.3"
+VERSION = "4.2.0"
 
 ROS_VERSION = 1 if "--ros1" in sys.argv else 2
 ROS_NODE = None
@@ -242,6 +242,15 @@ class TrialResult:
     gpu_min: Optional[float] = None
     gpu_max: Optional[float] = None
     gpu_avg: Optional[float] = None
+    ram_load_min: Optional[float] = None
+    ram_load_max: Optional[float] = None
+    ram_load_avg: Optional[float] = None
+    ram_used_min: Optional[float] = None
+    ram_used_max: Optional[float] = None
+    ram_used_avg: Optional[float] = None
+    cpu_temp_min: Optional[float] = None
+    cpu_temp_max: Optional[float] = None
+    cpu_temp_avg: Optional[float] = None
 
 
 class ResourceMonitor:
@@ -259,9 +268,13 @@ class ResourceMonitor:
         self.interval = interval
         self.cpu_samples: List[float] = []
         self.gpu_samples: List[float] = []
+        self.ram_load_samples: List[float] = []
+        self.ram_used_samples: List[float] = []
+        self.cpu_temp_samples: List[float] = []
         self._previous_cpu = None
         self._v3d_gpu_stats_path = self._find_v3d_gpu_stats()
         self._previous_v3d_stats = None
+        self._cpu_temperature_path = self._find_cpu_temperature_path()
         self._stop_event = threading.Event()
         self._thread = None
         self._lock = threading.Lock()
@@ -292,6 +305,61 @@ class ResourceMonitor:
         if total_delta <= 0:
             return None
         return max(0.0, min(100.0, 100.0 * (total_delta - idle_delta) / total_delta))
+
+    @staticmethod
+    def _sample_memory():
+        values = {}
+        try:
+            with open("/proc/meminfo", "r", encoding="ascii") as f:
+                for line in f:
+                    fields = line.split()
+                    if len(fields) >= 2 and fields[0].endswith(":"):
+                        values[fields[0][:-1]] = int(fields[1])
+        except (OSError, ValueError):
+            return None, None
+        total_kib = values.get("MemTotal")
+        available_kib = values.get("MemAvailable")
+        if not total_kib or available_kib is None or available_kib < 0:
+            return None, None
+        used_kib = max(0, total_kib - available_kib)
+        return min(100.0, 100.0 * used_kib / total_kib), used_kib / 1024.0
+
+    @staticmethod
+    def _read_text(path):
+        try:
+            with open(path, "r", encoding="ascii") as f:
+                return f.read().strip()
+        except OSError:
+            return None
+
+    @classmethod
+    def _find_cpu_temperature_path(cls):
+        for zone in sorted(glob.glob("/sys/class/thermal/thermal_zone*")):
+            zone_type = cls._read_text(os.path.join(zone, "type"))
+            path = os.path.join(zone, "temp")
+            if (zone_type and zone_type.lower() in ("cpu-thermal", "cpu_thermal", "soc_thermal")
+                    and os.path.isfile(path) and os.access(path, os.R_OK)):
+                return os.path.realpath(path)
+        for hwmon in sorted(glob.glob("/sys/class/hwmon/hwmon*")):
+            name = cls._read_text(os.path.join(hwmon, "name"))
+            if not name or name.lower() not in ("cpu_thermal", "cpu-thermal", "raspberrypi_hwmon"):
+                continue
+            for path in sorted(glob.glob(os.path.join(hwmon, "temp*_input"))):
+                if os.access(path, os.R_OK):
+                    return os.path.realpath(path)
+        return None
+
+    def _sample_cpu_temperature(self):
+        if self._cpu_temperature_path is None:
+            return None
+        raw = self._read_text(self._cpu_temperature_path)
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return None
+        if abs(value) >= 1000.0:
+            value /= 1000.0
+        return value if -40.0 <= value <= 150.0 else None
 
     @classmethod
     def _find_v3d_gpu_stats(cls):
@@ -377,11 +445,19 @@ class ResourceMonitor:
     def _sample(self):
         cpu = self._sample_cpu()
         gpu = self._sample_gpu()
+        ram_load, ram_used = self._sample_memory()
+        cpu_temp = self._sample_cpu_temperature()
         with self._lock:
             if cpu is not None:
                 self.cpu_samples.append(cpu)
             if gpu is not None:
                 self.gpu_samples.append(gpu)
+            if ram_load is not None:
+                self.ram_load_samples.append(ram_load)
+            if ram_used is not None:
+                self.ram_used_samples.append(ram_used)
+            if cpu_temp is not None:
+                self.cpu_temp_samples.append(cpu_temp)
 
     def _run(self):
         self._sample()
@@ -406,12 +482,21 @@ class ResourceMonitor:
     def apply_to(self, result: TrialResult) -> TrialResult:
         stats = self.snapshot()
         (result.cpu_min, result.cpu_max, result.cpu_avg,
-         result.gpu_min, result.gpu_max, result.gpu_avg) = stats
+         result.gpu_min, result.gpu_max, result.gpu_avg,
+         result.ram_load_min, result.ram_load_max, result.ram_load_avg,
+         result.ram_used_min, result.ram_used_max, result.ram_used_avg,
+         result.cpu_temp_min, result.cpu_temp_max, result.cpu_temp_avg) = stats
         return result
 
     def snapshot(self):
         with self._lock:
-            return self._stats(self.cpu_samples) + self._stats(self.gpu_samples)
+            return (
+                self._stats(self.cpu_samples)
+                + self._stats(self.gpu_samples)
+                + self._stats(self.ram_load_samples)
+                + self._stats(self.ram_used_samples)
+                + self._stats(self.cpu_temp_samples)
+            )
 
 
 class MeasurementSession:
@@ -1261,6 +1346,9 @@ def aggregate_trial_results(index: int, value: float, runs: List[TrialResult], m
         reason = "all repeats failed: " + " | ".join(r.reason for r in runs)
         cpu_min, cpu_max, cpu_avg = _aggregate_resource_stats(runs, "cpu")
         gpu_min, gpu_max, gpu_avg = _aggregate_resource_stats(runs, "gpu")
+        ram_load_min, ram_load_max, ram_load_avg = _aggregate_resource_stats(runs, "ram_load")
+        ram_used_min, ram_used_max, ram_used_avg = _aggregate_resource_stats(runs, "ram_used")
+        cpu_temp_min, cpu_temp_max, cpu_temp_avg = _aggregate_resource_stats(runs, "cpu_temp")
         return TrialResult(
             index=index,
             value=value,
@@ -1280,6 +1368,15 @@ def aggregate_trial_results(index: int, value: float, runs: List[TrialResult], m
             gpu_min=gpu_min,
             gpu_max=gpu_max,
             gpu_avg=gpu_avg,
+            ram_load_min=ram_load_min,
+            ram_load_max=ram_load_max,
+            ram_load_avg=ram_load_avg,
+            ram_used_min=ram_used_min,
+            ram_used_max=ram_used_max,
+            ram_used_avg=ram_used_avg,
+            cpu_temp_min=cpu_temp_min,
+            cpu_temp_max=cpu_temp_max,
+            cpu_temp_avg=cpu_temp_avg,
         )
 
     obj_values = [float(r.objective_score) for r in valid]
@@ -1293,6 +1390,9 @@ def aggregate_trial_results(index: int, value: float, runs: List[TrialResult], m
     representative = min(valid, key=lambda r: abs(float(r.objective_score) - agg_obj))
     cpu_min, cpu_max, cpu_avg = _aggregate_resource_stats(valid, "cpu")
     gpu_min, gpu_max, gpu_avg = _aggregate_resource_stats(valid, "gpu")
+    ram_load_min, ram_load_max, ram_load_avg = _aggregate_resource_stats(valid, "ram_load")
+    ram_used_min, ram_used_max, ram_used_avg = _aggregate_resource_stats(valid, "ram_used")
+    cpu_temp_min, cpu_temp_max, cpu_temp_avg = _aggregate_resource_stats(valid, "cpu_temp")
 
     agg = TrialResult(
         index=index,
@@ -1319,6 +1419,15 @@ def aggregate_trial_results(index: int, value: float, runs: List[TrialResult], m
         gpu_min=gpu_min,
         gpu_max=gpu_max,
         gpu_avg=gpu_avg,
+        ram_load_min=ram_load_min,
+        ram_load_max=ram_load_max,
+        ram_load_avg=ram_load_avg,
+        ram_used_min=ram_used_min,
+        ram_used_max=ram_used_max,
+        ram_used_avg=ram_used_avg,
+        cpu_temp_min=cpu_temp_min,
+        cpu_temp_max=cpu_temp_max,
+        cpu_temp_avg=cpu_temp_avg,
     )
     return agg
 
@@ -1328,10 +1437,10 @@ def format_change_line(score: float, baseline_score: Optional[float], best_score
     return info if info else "first valid result, used as baseline"
 
 
-def format_resource_load(minimum, maximum, average) -> str:
+def format_metric_stats(minimum, maximum, average, unit: str) -> str:
     if minimum is None or maximum is None or average is None:
         return "unavailable"
-    return f"min={minimum:.1f}% max={maximum:.1f}% avg={average:.1f}%"
+    return f"min={minimum:.1f}{unit} max={maximum:.1f}{unit} avg={average:.1f}{unit}"
 
 
 def print_measurement_metrics(r: TrialResult):
@@ -1353,8 +1462,11 @@ def print_measurement_metrics(r: TrialResult):
         print(f"Distance XY:    {r.distance_xy:.6f} m")
     if r.distance_xyz is not None:
         print(f"Distance XYZ:   {r.distance_xyz:.6f} m")
-    print(f"CPU load:       {format_resource_load(r.cpu_min, r.cpu_max, r.cpu_avg)}")
-    print(f"GPU load:       {format_resource_load(r.gpu_min, r.gpu_max, r.gpu_avg)}")
+    print(f"CPU load:       {format_metric_stats(r.cpu_min, r.cpu_max, r.cpu_avg, '%')}")
+    print(f"GPU load:       {format_metric_stats(r.gpu_min, r.gpu_max, r.gpu_avg, '%')}")
+    print(f"RAM load:       {format_metric_stats(r.ram_load_min, r.ram_load_max, r.ram_load_avg, '%')}")
+    print(f"RAM used:       {format_metric_stats(r.ram_used_min, r.ram_used_max, r.ram_used_avg, ' MiB')}")
+    print(f"CPU temperature: {format_metric_stats(r.cpu_temp_min, r.cpu_temp_max, r.cpu_temp_avg, '°C')}")
 
 
 def print_trial_result(
@@ -1408,7 +1520,10 @@ def save_csv(path: str, results: List[TrialResult]):
             "delta_xy_m", "delta_xy_stddev", "delta_xyz_m", "delta_xyz_stddev", "distance_xy_m", "distance_xyz_m",
             "duration_s", "odom_messages",
             "cpu_min_percent", "cpu_max_percent", "cpu_avg_percent",
-            "gpu_min_percent", "gpu_max_percent", "gpu_avg_percent", "reason",
+            "gpu_min_percent", "gpu_max_percent", "gpu_avg_percent",
+            "ram_load_min_percent", "ram_load_max_percent", "ram_load_avg_percent",
+            "ram_used_min_mib", "ram_used_max_mib", "ram_used_avg_mib",
+            "cpu_temp_min_c", "cpu_temp_max_c", "cpu_temp_avg_c", "reason",
             "start_x", "start_y", "start_z", "end_x", "end_y", "end_z",
         ])
         for r in results:
@@ -1432,6 +1547,15 @@ def save_csv(path: str, results: List[TrialResult]):
                 "" if r.gpu_min is None else f"{r.gpu_min:.3f}",
                 "" if r.gpu_max is None else f"{r.gpu_max:.3f}",
                 "" if r.gpu_avg is None else f"{r.gpu_avg:.3f}",
+                "" if r.ram_load_min is None else f"{r.ram_load_min:.3f}",
+                "" if r.ram_load_max is None else f"{r.ram_load_max:.3f}",
+                "" if r.ram_load_avg is None else f"{r.ram_load_avg:.3f}",
+                "" if r.ram_used_min is None else f"{r.ram_used_min:.3f}",
+                "" if r.ram_used_max is None else f"{r.ram_used_max:.3f}",
+                "" if r.ram_used_avg is None else f"{r.ram_used_avg:.3f}",
+                "" if r.cpu_temp_min is None else f"{r.cpu_temp_min:.3f}",
+                "" if r.cpu_temp_max is None else f"{r.cpu_temp_max:.3f}",
+                "" if r.cpu_temp_avg is None else f"{r.cpu_temp_avg:.3f}",
                 r.reason,
                 sx, sy, sz, ex, ey, ez,
             ])

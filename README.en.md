@@ -17,6 +17,7 @@ python3 vins_test.py --version
 - ROS2 and ROS1 support;
 - camera, IMU, and odometry message monitoring;
 - total CPU and GPU utilization monitoring during trials;
+- RAM utilization and CPU temperature monitoring;
 - stable starting-position lock (`FIXPOS`);
 - repeated trials with median or mean aggregation;
 - `Delta XY`, `Delta XYZ`, or composite objective scoring;
@@ -190,7 +191,7 @@ euroc_config.yaml.backup_vins_tune_YYYYMMDD_HHMMSS
 
 By default, the original configuration is restored when the program finishes or is stopped. Add `--keep-best` to leave the best value found in the YAML file.
 
-Results are saved to `vins_param_tune_results.csv`. Use `--csv` to select another path. Both the CSV file and console report include minimum, maximum, and average CPU/GPU utilization percentages for every result.
+Results are saved to `vins_param_tune_results.csv`. Use `--csv` to select another path. Both the CSV file and console report include minimum, maximum, and average CPU/GPU load, RAM load and used memory, and CPU temperature for every result.
 
 ## Controlling execution
 
