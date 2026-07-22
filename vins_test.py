@@ -35,6 +35,7 @@ Notes:
 import argparse
 import atexit
 import csv
+import glob
 import json
 import math
 import os
@@ -51,7 +52,7 @@ from typing import List, Optional, Tuple
 from collections import deque
 
 APP_NAME = "VINS Test"
-VERSION = "4.1.1"
+VERSION = "4.1.2"
 
 ROS_VERSION = 1 if "--ros1" in sys.argv else 2
 ROS_NODE = None
@@ -284,6 +285,24 @@ class ResourceMonitor:
 
     @staticmethod
     def _sample_gpu():
+        # Prefer a driver-provided Linux DRM utilization counter when present.
+        sysfs_values = []
+        for pattern in (
+            "/sys/class/drm/card*/device/gpu_busy_percent",
+            "/sys/class/drm/card*/device/gt_busy_percent",
+        ):
+            for path in glob.glob(pattern):
+                try:
+                    with open(path, "r", encoding="ascii") as f:
+                        value = float(f.read().strip())
+                    if 0.0 <= value <= 100.0:
+                        sysfs_values.append(value)
+                except (OSError, ValueError):
+                    pass
+        if sysfs_values:
+            return sum(sysfs_values) / len(sysfs_values)
+
+        # NVIDIA exposes utilization through nvidia-smi instead of DRM sysfs.
         try:
             result = subprocess.run(
                 ["nvidia-smi", "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"],
@@ -329,10 +348,72 @@ class ResourceMonitor:
         return min(samples), max(samples), sum(samples) / len(samples)
 
     def apply_to(self, result: TrialResult) -> TrialResult:
-        with self._lock:
-            result.cpu_min, result.cpu_max, result.cpu_avg = self._stats(self.cpu_samples)
-            result.gpu_min, result.gpu_max, result.gpu_avg = self._stats(self.gpu_samples)
+        stats = self.snapshot()
+        (result.cpu_min, result.cpu_max, result.cpu_avg,
+         result.gpu_min, result.gpu_max, result.gpu_avg) = stats
         return result
+
+    def snapshot(self):
+        with self._lock:
+            return self._stats(self.cpu_samples) + self._stats(self.gpu_samples)
+
+
+class MeasurementSession:
+    """Shared odometry and resource measurement used by tuning and --test."""
+
+    def __init__(self, start_pos, start_seq: int, start_time: Optional[float] = None, initial_count: int = 0):
+        now = time.time() if start_time is None else start_time
+        self.start_pos = start_pos
+        self.end_pos = start_pos
+        self.start_time = now
+        self.end_time = now
+        self.count = initial_count
+        self.last_seq = start_seq
+        self.last_path_pos = start_pos
+        self.distance_xy = 0.0
+        self.distance_xyz = 0.0
+        self.resource_monitor = ResourceMonitor()
+        self.resource_monitor.start()
+        self._finished = False
+
+    def update(self, pos, seq: int, timestamp: Optional[float] = None) -> bool:
+        if pos is None or seq == self.last_seq:
+            return False
+        now = time.time() if timestamp is None else timestamp
+        if self.last_path_pos is not None:
+            self.distance_xy += dist_xy(self.last_path_pos, pos)
+            self.distance_xyz += dist_xyz(self.last_path_pos, pos)
+        self.last_path_pos = pos
+        self.end_pos = pos
+        self.end_time = now
+        self.count += max(1, seq - self.last_seq)
+        self.last_seq = seq
+        return True
+
+    def finish(self):
+        if not self._finished:
+            self.resource_monitor.stop()
+            self._finished = True
+
+    def result(self, index: int, value: float, ok: bool, reason: str) -> TrialResult:
+        self.finish()
+        delta_xy = dist_xy(self.start_pos, self.end_pos) if self.start_pos is not None and self.end_pos is not None else None
+        delta_xyz = dist_xyz(self.start_pos, self.end_pos) if self.start_pos is not None and self.end_pos is not None else None
+        result = TrialResult(
+            index=index,
+            value=value,
+            score_delta_xy=delta_xy,
+            delta_xyz=delta_xyz,
+            duration=max(0.0, self.end_time - self.start_time),
+            odom_messages=self.count,
+            start_pos=self.start_pos,
+            end_pos=self.end_pos,
+            ok=ok,
+            reason=reason,
+            distance_xy=self.distance_xy,
+            distance_xyz=self.distance_xyz,
+        )
+        return self.resource_monitor.apply_to(result)
 
 
 @dataclass
@@ -895,25 +976,14 @@ def run_trial(args, trial_index: int, value: float, original_text: str, repeat_i
     launch_proc = None
     bag_proc = None
 
-    start_seq = odom_seq
     start_cam_seq = cam_seq
     start_imu_seq = imu_seq
-    start_pos = None
-    end_pos = None
     start_time = time.time()
-    end_time = start_time
 
     print()
     title = f"========== TRIAL #{trial_index}" + (f" RUN {repeat_index}/{repeats}" if repeats > 1 else "") + " =========="
     print(title)
     print(f"{args.param}: {value:.9f}")
-
-    resource_monitor = ResourceMonitor()
-    resource_monitor.start()
-
-    def make_result(*result_args, **result_kwargs):
-        resource_monitor.stop()
-        return resource_monitor.apply_to(TrialResult(*result_args, **result_kwargs))
 
     try:
         launch_proc = start_process(args, args.launch_cmd, "roslaunch", show_output=args.show_roslaunch_output)
@@ -921,7 +991,7 @@ def run_trial(args, trial_index: int, value: float, original_text: str, repeat_i
         if launch_proc.poll() is not None:
             reason = f"roslaunch exited before rosbag start, code={launch_proc.returncode}"
             stop_process(launch_proc, "vins")
-            return make_result(trial_index, value, None, None, time.time() - start_time, 0, None, None, False, reason)
+            return TrialResult(trial_index, value, None, None, time.time() - start_time, 0, None, None, False, reason)
 
         quoted_bag = shlex.quote(args.bag)
         if args.clock:
@@ -936,14 +1006,14 @@ def run_trial(args, trial_index: int, value: float, original_text: str, repeat_i
         if bag_proc.poll() is not None:
             reason = f"rosbag exited immediately, code={bag_proc.returncode}"
             stop_process(launch_proc, "vins")
-            return make_result(trial_index, value, None, None, time.time() - start_time, 0, None, None, False, reason)
+            return TrialResult(trial_index, value, None, None, time.time() - start_time, 0, None, None, False, reason)
 
         topics_ok, topics_reason = wait_for_topic_activity(args, start_cam_seq, start_imu_seq, args.topic_wait)
         if not topics_ok:
             reason = topics_reason
             stop_process(bag_proc, "rosbag")
             stop_process(launch_proc, "vins")
-            return make_result(trial_index, value, None, None, time.time() - start_time, 0, None, None, False, reason)
+            return TrialResult(trial_index, value, None, None, time.time() - start_time, 0, None, None, False, reason)
 
         print()
         print(f"[DBG] Waiting for odometry topic: {args.odom_topic}")
@@ -951,7 +1021,7 @@ def run_trial(args, trial_index: int, value: float, original_text: str, repeat_i
             reason = f"no odometry on {args.odom_topic} within {args.odom_wait:.1f}s"
             stop_process(bag_proc, "rosbag")
             stop_process(launch_proc, "vins")
-            return make_result(trial_index, value, None, None, time.time() - start_time, 0, None, None, False, reason)
+            return TrialResult(trial_index, value, None, None, time.time() - start_time, 0, None, None, False, reason)
 
         # Lock a stable start position before the real scoring starts.
         # With FIXPOS enabled, start_pos is an average over a stable odometry window.
@@ -961,17 +1031,11 @@ def run_trial(args, trial_index: int, value: float, original_text: str, repeat_i
             reason = fixed_reason
             stop_process(bag_proc, "rosbag")
             stop_process(launch_proc, "vins")
-            return make_result(trial_index, value, None, None, time.time() - start_time, 0, None, None, False, reason)
+            return TrialResult(trial_index, value, None, None, time.time() - start_time, 0, None, None, False, reason)
 
-        start_pos = fixed_start_pos
-        end_pos = start_pos
         # Start duration and path accumulation only after FIXPOS lock.
         start_time = time.time()
-        end_time = start_time
-        last_path_pos = start_pos
-        path_distance_xy = 0.0
-        path_distance_xyz = 0.0
-        last_seen_seq = first_seq
+        measurement = MeasurementSession(fixed_start_pos, first_seq, start_time=start_time)
         last_live_print = 0.0
         live_line_used = False
 
@@ -982,7 +1046,7 @@ def run_trial(args, trial_index: int, value: float, original_text: str, repeat_i
                 stop_process(launch_proc, "vins")
                 if live_line_used:
                     finish_live_line()
-                return make_result(trial_index, value, None, None, time.time() - start_time, max(0, odom_seq - first_seq + 1), start_pos, end_pos, False, reason, path_distance_xy, path_distance_xyz)
+                return measurement.result(trial_index, value, False, reason)
             if bag_proc.poll() is not None:
                 break
             if time.time() - start_time > args.max_trial_time:
@@ -990,28 +1054,19 @@ def run_trial(args, trial_index: int, value: float, original_text: str, repeat_i
                 stop_process(bag_proc, "rosbag")
                 stop_process(launch_proc, "vins")
                 if last_odom is not None:
-                    end_pos = get_pos(last_odom)
-                    end_time = time.time()
+                    measurement.update(get_pos(last_odom), odom_seq, time.time())
                 if 'live_line_used' in locals() and live_line_used:
                     finish_live_line()
-                msg_count = max(0, odom_seq - first_seq + 1)
-                score = dist_xy(start_pos, end_pos) if start_pos and end_pos else None
-                dz = dist_xyz(start_pos, end_pos) if start_pos and end_pos else None
-                return make_result(trial_index, value, score, dz, end_time - start_time, msg_count, start_pos, end_pos, False, reason, path_distance_xy, path_distance_xyz)
+                return measurement.result(trial_index, value, False, reason)
 
-            if odom_seq != last_seen_seq and last_odom is not None:
-                new_pos = get_pos(last_odom)
-                if last_path_pos is not None:
-                    path_distance_xy += dist_xy(last_path_pos, new_pos)
-                    path_distance_xyz += dist_xyz(last_path_pos, new_pos)
-                last_path_pos = new_pos
-                end_pos = new_pos
-                end_time = time.time()
-                last_seen_seq = odom_seq
+            if last_odom is not None:
+                measurement.update(get_pos(last_odom), odom_seq, time.time())
 
             if time.time() - last_live_print >= args.pos_print_period:
-                msg_count_live = max(0, odom_seq - first_seq + 1)
-                print_live_position(trial_index, value, msg_count_live, start_pos, end_pos, end_time, start_time)
+                print_live_position(
+                    trial_index, value, measurement.count, measurement.start_pos,
+                    measurement.end_pos, measurement.end_time, measurement.start_time,
+                )
                 live_line_used = True
                 last_live_print = time.time()
 
@@ -1023,25 +1078,20 @@ def run_trial(args, trial_index: int, value: float, original_text: str, repeat_i
         # Give VINS a small window to publish last messages after rosbag EOF.
         time.sleep(args.after_bag_wait)
         if last_odom is not None:
-            end_pos = get_pos(last_odom)
-            end_time = time.time()
+            measurement.update(get_pos(last_odom), odom_seq, time.time())
 
-        msg_count = max(0, odom_seq - first_seq + 1)
-        if start_pos is None or end_pos is None or msg_count <= 0:
+        if measurement.start_pos is None or measurement.end_pos is None or measurement.count <= 0:
             reason = "no complete odometry session was recorded"
-            score = None
-            dz = None
             ok = False
         else:
-            score = dist_xy(start_pos, end_pos)
-            dz = dist_xyz(start_pos, end_pos)
             reason = "OK"
             ok = True
 
-        return make_result(trial_index, value, score, dz, end_time - start_time, msg_count, start_pos, end_pos, ok, reason, path_distance_xy, path_distance_xyz)
+        return measurement.result(trial_index, value, ok, reason)
 
     finally:
-        resource_monitor.stop()
+        if "measurement" in locals():
+            measurement.finish()
         stop_process(bag_proc, "rosbag")
         stop_process(launch_proc, "vins")
         time.sleep(args.between_trials)
@@ -1222,10 +1272,33 @@ def format_change_line(score: float, baseline_score: Optional[float], best_score
     return info if info else "first valid result, used as baseline"
 
 
-def format_resource_load(name: str, minimum, maximum, average) -> str:
+def format_resource_load(minimum, maximum, average) -> str:
     if minimum is None or maximum is None or average is None:
-        return f"{name}: unavailable"
-    return f"{name}: min={minimum:.1f}% max={maximum:.1f}% avg={average:.1f}%"
+        return "unavailable"
+    return f"min={minimum:.1f}% max={maximum:.1f}% avg={average:.1f}%"
+
+
+def print_measurement_metrics(r: TrialResult):
+    """Print metrics shared by tuning and standalone reports."""
+    print(f"Messages:       {r.odom_messages}")
+    print(f"Duration:       {r.duration:.3f} s")
+    print(f"Start position: {format_pos(r.start_pos)}")
+    print(f"End position:   {format_pos(r.end_pos)}")
+    if r.start_pos is not None and r.end_pos is not None:
+        dx = r.end_pos[0] - r.start_pos[0]
+        dy = r.end_pos[1] - r.start_pos[1]
+        dz = r.end_pos[2] - r.start_pos[2]
+        print(f"Delta position: dx={dx: .6f}  dy={dy: .6f}  dz={dz: .6f}")
+    if r.score_delta_xy is not None:
+        print(f"Delta XY:       {r.score_delta_xy:.6f} m")
+    if r.delta_xyz is not None:
+        print(f"Delta XYZ:      {r.delta_xyz:.6f} m")
+    if r.distance_xy is not None:
+        print(f"Distance XY:    {r.distance_xy:.6f} m")
+    if r.distance_xyz is not None:
+        print(f"Distance XYZ:   {r.distance_xyz:.6f} m")
+    print(f"CPU load:       {format_resource_load(r.cpu_min, r.cpu_max, r.cpu_avg)}")
+    print(f"GPU load:       {format_resource_load(r.gpu_min, r.gpu_max, r.gpu_avg)}")
 
 
 def print_trial_result(
@@ -1254,10 +1327,8 @@ def print_trial_result(
     print(f"Step size:  {step:.9f}")
     print(f"Direction:  {dir_txt}")
     print(f"Limits:     fails {fails_at_current_step}/{max_fails}, step reductions {step_reductions}/{max_step_reductions}")
-    print(f"Load:       {format_resource_load('CPU', r.cpu_min, r.cpu_max, r.cpu_avg)}")
-    print(f"            {format_resource_load('GPU', r.gpu_min, r.gpu_max, r.gpu_avg)}")
-
     if not r.ok:
+        print_measurement_metrics(r)
         print(f"Verdict:    FAIL")
         print(f"Reason:     {r.reason}")
         print("------------------------")
@@ -1268,14 +1339,7 @@ def print_trial_result(
     print(f"Objective:  {r.objective_score:.6f}  ({getattr(args, 'objective_name', 'score')}, lower is better)")
     if r.score_stddev is not None and getattr(r, "repeat_count", 1) > 1:
         print(f"StdDev:     score={r.score_stddev:.6f}  DeltaXY={r.delta_xy_stddev:.6f}  DeltaXYZ={r.delta_xyz_stddev:.6f}")
-    print(f"Delta XY:   {r.score_delta_xy:.6f} m")
-    print(f"Delta XYZ:  {r.delta_xyz:.6f} m")
-    if r.distance_xy is not None and r.distance_xyz is not None:
-        print(f"Distance:   XY={r.distance_xy:.6f} m  XYZ={r.distance_xyz:.6f} m")
-    print(f"Messages:   {r.odom_messages}")
-    print(f"Duration:   {r.duration:.3f} s")
-    print(f"Start:      x={r.start_pos[0]: .6f} y={r.start_pos[1]: .6f} z={r.start_pos[2]: .6f}")
-    print(f"End:        x={r.end_pos[0]: .6f} y={r.end_pos[1]: .6f} z={r.end_pos[2]: .6f}")
+    print_measurement_metrics(r)
     print(f"Change:     {format_change_line(r.objective_score, baseline_score, best_score_before)}")
     print("------------------------")
 
@@ -1318,25 +1382,16 @@ def save_csv(path: str, results: List[TrialResult]):
 
 
 
-def print_standalone_report(test_id, reason, start_pos, end_pos, start_time, end_time, count, path_xy, path_xyz):
+def print_standalone_report(test_id, reason, measurement: Optional[MeasurementSession]):
     print()
     print(f"========== VINS TEST #{test_id} ==========")
     print(f"Finish reason: {reason}")
-    if start_pos is None or end_pos is None:
+    if measurement is None:
         print("No complete VINS odometry session was recorded.")
         print("====================================")
         return
-    dx, dy, dz = end_pos[0]-start_pos[0], end_pos[1]-start_pos[1], end_pos[2]-start_pos[2]
-    duration = max(0.0, (end_time or time.time()) - (start_time or time.time()))
-    print(f"Odometry messages: {count}")
-    print(f"Duration: {duration:.3f} s")
-    print(f"Start position:  {format_pos(start_pos)}")
-    print(f"End position:    {format_pos(end_pos)}")
-    print(f"Delta position:  dx={dx: .6f}  dy={dy: .6f}  dz={dz: .6f}")
-    print(f"Delta XY:        {math.hypot(dx, dy):.6f} m")
-    print(f"Delta XYZ:       {math.sqrt(dx*dx+dy*dy+dz*dz):.6f} m")
-    print(f"Distance XY:     {path_xy:.6f} m")
-    print(f"Distance XYZ:    {path_xyz:.6f} m")
+    result = measurement.result(test_id, 0.0, True, reason)
+    print_measurement_metrics(result)
     print("====================================")
 
 
@@ -1352,12 +1407,7 @@ def run_standalone_test(args):
 
     state = "WAITING"
     test_id = 0
-    start_pos = end_pos = None
-    start_time = end_time = None
-    count = 0
-    last_seq = odom_seq
-    path_xy = path_xyz = 0.0
-    last_path = None
+    measurement = None
     samples = deque()
     last_fix_seq = -1
 
@@ -1375,9 +1425,8 @@ def run_standalone_test(args):
             if state in ("FIXING", "RECORDING"):
                 print()
                 test_id += 1
-                print_standalone_report(test_id, reason, start_pos, end_pos, start_time, end_time, count, path_xy, path_xyz)
-                state = "WAITING"; start_pos = end_pos = None; start_time = end_time = None
-                count = 0; last_seq = odom_seq; path_xy = path_xyz = 0.0; last_path = None
+                print_standalone_report(test_id, reason, measurement)
+                state = "WAITING"; measurement = None
                 samples.clear(); last_fix_seq = -1
             time.sleep(0.2)
             continue
@@ -1386,8 +1435,8 @@ def run_standalone_test(args):
             if args.fixpos_enabled:
                 state = "FIXING"; samples.clear(); last_fix_seq = -1
             else:
-                state = "RECORDING"; start_pos = end_pos = pos; start_time = end_time = now
-                count = 1; last_seq = odom_seq; last_path = pos
+                state = "RECORDING"
+                measurement = MeasurementSession(pos, odom_seq, start_time=now, initial_count=1)
 
         if state == "FIXING":
             if odom_seq != last_fix_seq and pos is not None:
@@ -1405,19 +1454,24 @@ def run_standalone_test(args):
                 avg, rx, ry, rz, n = info
                 print()
                 print(f"FIXPOS locked: {format_pos(avg)} | range dx={rx:.4f} dy={ry:.4f} dz={rz:.4f}")
-                start_pos = end_pos = avg; start_time = end_time = now; count = 0
-                last_seq = odom_seq; last_path = avg; state = "RECORDING"
+                measurement = MeasurementSession(avg, odom_seq, start_time=now)
+                state = "RECORDING"
             time.sleep(0.05)
             continue
 
         if state == "RECORDING":
-            if odom_seq != last_seq and pos is not None:
-                path_xy += dist_xy(last_path, pos); path_xyz += dist_xyz(last_path, pos)
-                last_path = end_pos = pos; end_time = now
-                count += max(1, odom_seq-last_seq); last_seq = odom_seq
+            measurement.update(pos, odom_seq, now)
             clear_current_line()
-            print(f"[{time.strftime('%H:%M:%S')}] VINS POS {format_pos(pos)} | count={count} | DistanceXY={path_xy:.3f}m", end="", flush=True)
+            print(
+                f"[{time.strftime('%H:%M:%S')}] VINS POS {format_pos(pos)} | "
+                f"count={measurement.count} | DistanceXY={measurement.distance_xy:.3f}m",
+                end="", flush=True,
+            )
         time.sleep(0.2)
+    if measurement is not None:
+        print()
+        test_id += 1
+        print_standalone_report(test_id, "stopped by user", measurement)
     print()
 
 

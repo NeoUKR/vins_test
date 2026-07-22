@@ -1,3 +1,9 @@
+Changes in 4.1.2:
+  - use one MeasurementSession implementation for tuning and standalone tests
+  - include CPU/GPU min, max, and average load in standalone reports
+  - share odometry, duration, distance, resource collection, and report formatting
+  - read GPU utilization from Linux DRM sysfs with nvidia-smi as fallback
+
 Changes in 4.1.1:
   - show the current application version when standalone test mode starts
 

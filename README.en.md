@@ -16,14 +16,14 @@ python3 vins_test.py --version
 - automatic local search for the best YAML parameter value;
 - ROS2 and ROS1 support;
 - camera, IMU, and odometry message monitoring;
-- total CPU and NVIDIA GPU utilization monitoring during trials;
+- total CPU and GPU utilization monitoring during trials;
 - stable starting-position lock (`FIXPOS`);
 - repeated trials with median or mean aggregation;
 - `Delta XY`, `Delta XYZ`, or composite objective scoring;
 - configuration backup and automatic restoration;
 - CSV output for all trial results.
 
-GPU monitoring uses `nvidia-smi`. If an NVIDIA GPU or this command is unavailable, the trial continues; GPU metrics are reported as `unavailable` and the corresponding CSV fields remain empty.
+GPU monitoring first uses a Linux DRM utilization counter from sysfs when the driver provides one, with `nvidia-smi` as the NVIDIA fallback. If the driver exposes no supported source, the trial continues; GPU metrics are reported as `unavailable` and the corresponding CSV fields remain empty.
 
 ## Requirements
 
@@ -49,7 +49,7 @@ Start VINS and the camera and IMU data sources first. Then open another terminal
 python3 vins_test.py --test
 ```
 
-At startup, standalone mode displays the current application version, selected ROS variant, and the odometry and IMU topics.
+At startup, standalone mode displays the current application version, selected ROS variant, and the odometry and IMU topics. Its session report also includes minimum, maximum, and average CPU/GPU utilization.
 
 ROS2 is used by default. Add `--ros1` to use ROS1:
 
