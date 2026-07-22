@@ -51,7 +51,7 @@ from typing import List, Optional, Tuple
 from collections import deque
 
 APP_NAME = "VINS Test"
-VERSION = "4.0.1"
+VERSION = "4.1.0"
 
 ROS_VERSION = 1 if "--ros1" in sys.argv else 2
 ROS_NODE = None
@@ -235,6 +235,104 @@ class TrialResult:
     score_stddev: Optional[float] = None
     delta_xy_stddev: Optional[float] = None
     delta_xyz_stddev: Optional[float] = None
+    cpu_min: Optional[float] = None
+    cpu_max: Optional[float] = None
+    cpu_avg: Optional[float] = None
+    gpu_min: Optional[float] = None
+    gpu_max: Optional[float] = None
+    gpu_avg: Optional[float] = None
+
+
+class ResourceMonitor:
+    """Sample total CPU and NVIDIA GPU utilization in a background thread."""
+
+    def __init__(self, interval: float = 1.0):
+        self.interval = interval
+        self.cpu_samples: List[float] = []
+        self.gpu_samples: List[float] = []
+        self._previous_cpu = None
+        self._stop_event = threading.Event()
+        self._thread = None
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _read_cpu_times():
+        try:
+            with open("/proc/stat", "r", encoding="ascii") as f:
+                fields = f.readline().split()
+            if not fields or fields[0] != "cpu" or len(fields) < 5:
+                return None
+            values = [float(x) for x in fields[1:]]
+            idle = values[3] + (values[4] if len(values) > 4 else 0.0)
+            # guest and guest_nice are already included in user and nice.
+            return sum(values[:8]), idle
+        except (OSError, ValueError):
+            return None
+
+    def _sample_cpu(self):
+        current = self._read_cpu_times()
+        if current is None:
+            return None
+        previous, self._previous_cpu = self._previous_cpu, current
+        if previous is None:
+            return None
+        total_delta = current[0] - previous[0]
+        idle_delta = current[1] - previous[1]
+        if total_delta <= 0:
+            return None
+        return max(0.0, min(100.0, 100.0 * (total_delta - idle_delta) / total_delta))
+
+    @staticmethod
+    def _sample_gpu():
+        try:
+            result = subprocess.run(
+                ["nvidia-smi", "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"],
+                capture_output=True,
+                text=True,
+                timeout=2,
+                check=False,
+            )
+            values = [float(line.strip()) for line in result.stdout.splitlines() if line.strip()]
+            if result.returncode == 0 and values:
+                return sum(values) / len(values)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            pass
+        return None
+
+    def _sample(self):
+        cpu = self._sample_cpu()
+        gpu = self._sample_gpu()
+        with self._lock:
+            if cpu is not None:
+                self.cpu_samples.append(cpu)
+            if gpu is not None:
+                self.gpu_samples.append(gpu)
+
+    def _run(self):
+        self._sample()
+        while not self._stop_event.wait(self.interval):
+            self._sample()
+
+    def start(self):
+        self._thread = threading.Thread(target=self._run, name="resource-monitor", daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=3.0)
+
+    @staticmethod
+    def _stats(samples):
+        if not samples:
+            return None, None, None
+        return min(samples), max(samples), sum(samples) / len(samples)
+
+    def apply_to(self, result: TrialResult) -> TrialResult:
+        with self._lock:
+            result.cpu_min, result.cpu_max, result.cpu_avg = self._stats(self.cpu_samples)
+            result.gpu_min, result.gpu_max, result.gpu_avg = self._stats(self.gpu_samples)
+        return result
 
 
 @dataclass
@@ -810,13 +908,20 @@ def run_trial(args, trial_index: int, value: float, original_text: str, repeat_i
     print(title)
     print(f"{args.param}: {value:.9f}")
 
+    resource_monitor = ResourceMonitor()
+    resource_monitor.start()
+
+    def make_result(*result_args, **result_kwargs):
+        resource_monitor.stop()
+        return resource_monitor.apply_to(TrialResult(*result_args, **result_kwargs))
+
     try:
         launch_proc = start_process(args, args.launch_cmd, "roslaunch", show_output=args.show_roslaunch_output)
         time.sleep(args.launch_wait)
         if launch_proc.poll() is not None:
             reason = f"roslaunch exited before rosbag start, code={launch_proc.returncode}"
             stop_process(launch_proc, "vins")
-            return TrialResult(trial_index, value, None, None, time.time() - start_time, 0, None, None, False, reason)
+            return make_result(trial_index, value, None, None, time.time() - start_time, 0, None, None, False, reason)
 
         quoted_bag = shlex.quote(args.bag)
         if args.clock:
@@ -831,14 +936,14 @@ def run_trial(args, trial_index: int, value: float, original_text: str, repeat_i
         if bag_proc.poll() is not None:
             reason = f"rosbag exited immediately, code={bag_proc.returncode}"
             stop_process(launch_proc, "vins")
-            return TrialResult(trial_index, value, None, None, time.time() - start_time, 0, None, None, False, reason)
+            return make_result(trial_index, value, None, None, time.time() - start_time, 0, None, None, False, reason)
 
         topics_ok, topics_reason = wait_for_topic_activity(args, start_cam_seq, start_imu_seq, args.topic_wait)
         if not topics_ok:
             reason = topics_reason
             stop_process(bag_proc, "rosbag")
             stop_process(launch_proc, "vins")
-            return TrialResult(trial_index, value, None, None, time.time() - start_time, 0, None, None, False, reason)
+            return make_result(trial_index, value, None, None, time.time() - start_time, 0, None, None, False, reason)
 
         print()
         print(f"[DBG] Waiting for odometry topic: {args.odom_topic}")
@@ -846,7 +951,7 @@ def run_trial(args, trial_index: int, value: float, original_text: str, repeat_i
             reason = f"no odometry on {args.odom_topic} within {args.odom_wait:.1f}s"
             stop_process(bag_proc, "rosbag")
             stop_process(launch_proc, "vins")
-            return TrialResult(trial_index, value, None, None, time.time() - start_time, 0, None, None, False, reason)
+            return make_result(trial_index, value, None, None, time.time() - start_time, 0, None, None, False, reason)
 
         # Lock a stable start position before the real scoring starts.
         # With FIXPOS enabled, start_pos is an average over a stable odometry window.
@@ -856,7 +961,7 @@ def run_trial(args, trial_index: int, value: float, original_text: str, repeat_i
             reason = fixed_reason
             stop_process(bag_proc, "rosbag")
             stop_process(launch_proc, "vins")
-            return TrialResult(trial_index, value, None, None, time.time() - start_time, 0, None, None, False, reason)
+            return make_result(trial_index, value, None, None, time.time() - start_time, 0, None, None, False, reason)
 
         start_pos = fixed_start_pos
         end_pos = start_pos
@@ -877,7 +982,7 @@ def run_trial(args, trial_index: int, value: float, original_text: str, repeat_i
                 stop_process(launch_proc, "vins")
                 if live_line_used:
                     finish_live_line()
-                return TrialResult(trial_index, value, None, None, time.time() - start_time, max(0, odom_seq - first_seq + 1), start_pos, end_pos, False, reason, path_distance_xy, path_distance_xyz)
+                return make_result(trial_index, value, None, None, time.time() - start_time, max(0, odom_seq - first_seq + 1), start_pos, end_pos, False, reason, path_distance_xy, path_distance_xyz)
             if bag_proc.poll() is not None:
                 break
             if time.time() - start_time > args.max_trial_time:
@@ -892,7 +997,7 @@ def run_trial(args, trial_index: int, value: float, original_text: str, repeat_i
                 msg_count = max(0, odom_seq - first_seq + 1)
                 score = dist_xy(start_pos, end_pos) if start_pos and end_pos else None
                 dz = dist_xyz(start_pos, end_pos) if start_pos and end_pos else None
-                return TrialResult(trial_index, value, score, dz, end_time - start_time, msg_count, start_pos, end_pos, False, reason, path_distance_xy, path_distance_xyz)
+                return make_result(trial_index, value, score, dz, end_time - start_time, msg_count, start_pos, end_pos, False, reason, path_distance_xy, path_distance_xyz)
 
             if odom_seq != last_seen_seq and last_odom is not None:
                 new_pos = get_pos(last_odom)
@@ -933,9 +1038,10 @@ def run_trial(args, trial_index: int, value: float, original_text: str, repeat_i
             reason = "OK"
             ok = True
 
-        return TrialResult(trial_index, value, score, dz, end_time - start_time, msg_count, start_pos, end_pos, ok, reason, path_distance_xy, path_distance_xyz)
+        return make_result(trial_index, value, score, dz, end_time - start_time, msg_count, start_pos, end_pos, ok, reason, path_distance_xy, path_distance_xyz)
 
     finally:
+        resource_monitor.stop()
         stop_process(bag_proc, "rosbag")
         stop_process(launch_proc, "vins")
         time.sleep(args.between_trials)
@@ -1032,10 +1138,23 @@ def _stddev(values: List[float]) -> Optional[float]:
     return float(statistics.stdev(values))
 
 
+def _aggregate_resource_stats(runs: List[TrialResult], prefix: str):
+    minimums = [getattr(r, f"{prefix}_min") for r in runs if getattr(r, f"{prefix}_min") is not None]
+    maximums = [getattr(r, f"{prefix}_max") for r in runs if getattr(r, f"{prefix}_max") is not None]
+    averages = [getattr(r, f"{prefix}_avg") for r in runs if getattr(r, f"{prefix}_avg") is not None]
+    return (
+        min(minimums) if minimums else None,
+        max(maximums) if maximums else None,
+        sum(averages) / len(averages) if averages else None,
+    )
+
+
 def aggregate_trial_results(index: int, value: float, runs: List[TrialResult], method: str) -> TrialResult:
     valid = [r for r in runs if r.ok and r.objective_score is not None]
     if not valid:
         reason = "all repeats failed: " + " | ".join(r.reason for r in runs)
+        cpu_min, cpu_max, cpu_avg = _aggregate_resource_stats(runs, "cpu")
+        gpu_min, gpu_max, gpu_avg = _aggregate_resource_stats(runs, "gpu")
         return TrialResult(
             index=index,
             value=value,
@@ -1049,6 +1168,12 @@ def aggregate_trial_results(index: int, value: float, runs: List[TrialResult], m
             reason=reason,
             repeat_count=len(runs),
             valid_repeats=0,
+            cpu_min=cpu_min,
+            cpu_max=cpu_max,
+            cpu_avg=cpu_avg,
+            gpu_min=gpu_min,
+            gpu_max=gpu_max,
+            gpu_avg=gpu_avg,
         )
 
     obj_values = [float(r.objective_score) for r in valid]
@@ -1060,6 +1185,8 @@ def aggregate_trial_results(index: int, value: float, runs: List[TrialResult], m
     # Pick representative start/end from the run nearest to the aggregated objective.
     agg_obj = _aggregate(obj_values, method)
     representative = min(valid, key=lambda r: abs(float(r.objective_score) - agg_obj))
+    cpu_min, cpu_max, cpu_avg = _aggregate_resource_stats(valid, "cpu")
+    gpu_min, gpu_max, gpu_avg = _aggregate_resource_stats(valid, "gpu")
 
     agg = TrialResult(
         index=index,
@@ -1080,6 +1207,12 @@ def aggregate_trial_results(index: int, value: float, runs: List[TrialResult], m
         score_stddev=_stddev(obj_values),
         delta_xy_stddev=_stddev(xy_values),
         delta_xyz_stddev=_stddev(xyz_values),
+        cpu_min=cpu_min,
+        cpu_max=cpu_max,
+        cpu_avg=cpu_avg,
+        gpu_min=gpu_min,
+        gpu_max=gpu_max,
+        gpu_avg=gpu_avg,
     )
     return agg
 
@@ -1087,6 +1220,12 @@ def aggregate_trial_results(index: int, value: float, runs: List[TrialResult], m
 def format_change_line(score: float, baseline_score: Optional[float], best_score_before: Optional[float]) -> str:
     info = describe_improvement(score, baseline_score, best_score_before)
     return info if info else "first valid result, used as baseline"
+
+
+def format_resource_load(name: str, minimum, maximum, average) -> str:
+    if minimum is None or maximum is None or average is None:
+        return f"{name}: unavailable"
+    return f"{name}: min={minimum:.1f}% max={maximum:.1f}% avg={average:.1f}%"
 
 
 def print_trial_result(
@@ -1115,6 +1254,8 @@ def print_trial_result(
     print(f"Step size:  {step:.9f}")
     print(f"Direction:  {dir_txt}")
     print(f"Limits:     fails {fails_at_current_step}/{max_fails}, step reductions {step_reductions}/{max_step_reductions}")
+    print(f"Load:       {format_resource_load('CPU', r.cpu_min, r.cpu_max, r.cpu_avg)}")
+    print(f"            {format_resource_load('GPU', r.gpu_min, r.gpu_max, r.gpu_avg)}")
 
     if not r.ok:
         print(f"Verdict:    FAIL")
@@ -1145,7 +1286,9 @@ def save_csv(path: str, results: List[TrialResult]):
         w.writerow([
             "trial", "value", "ok", "objective_score", "score_stddev", "valid_repeats", "repeat_count",
             "delta_xy_m", "delta_xy_stddev", "delta_xyz_m", "delta_xyz_stddev", "distance_xy_m", "distance_xyz_m",
-            "duration_s", "odom_messages", "reason",
+            "duration_s", "odom_messages",
+            "cpu_min_percent", "cpu_max_percent", "cpu_avg_percent",
+            "gpu_min_percent", "gpu_max_percent", "gpu_avg_percent", "reason",
             "start_x", "start_y", "start_z", "end_x", "end_y", "end_z",
         ])
         for r in results:
@@ -1162,7 +1305,14 @@ def save_csv(path: str, results: List[TrialResult]):
                 "" if r.delta_xyz_stddev is None else f"{r.delta_xyz_stddev:.9f}",
                 "" if r.distance_xy is None else f"{r.distance_xy:.9f}",
                 "" if r.distance_xyz is None else f"{r.distance_xyz:.9f}",
-                f"{r.duration:.3f}", r.odom_messages, r.reason,
+                f"{r.duration:.3f}", r.odom_messages,
+                "" if r.cpu_min is None else f"{r.cpu_min:.3f}",
+                "" if r.cpu_max is None else f"{r.cpu_max:.3f}",
+                "" if r.cpu_avg is None else f"{r.cpu_avg:.3f}",
+                "" if r.gpu_min is None else f"{r.gpu_min:.3f}",
+                "" if r.gpu_max is None else f"{r.gpu_max:.3f}",
+                "" if r.gpu_avg is None else f"{r.gpu_avg:.3f}",
+                r.reason,
                 sx, sy, sz, ex, ey, ez,
             ])
 
@@ -1489,7 +1639,7 @@ def main():
         print("4. Probe both sides around the current best; reduce step when neither side improves.")
         return
 
-    init_ros_node(args, "vins_param_tuner_4_0_0")
+    init_ros_node(args, "vins_param_tuner")
 
     results: List[TrialResult] = []
     tried = set()

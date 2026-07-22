@@ -16,11 +16,14 @@ python3 vins_test.py --version
 - automatic local search for the best YAML parameter value;
 - ROS2 and ROS1 support;
 - camera, IMU, and odometry message monitoring;
+- total CPU and NVIDIA GPU utilization monitoring during trials;
 - stable starting-position lock (`FIXPOS`);
 - repeated trials with median or mean aggregation;
 - `Delta XY`, `Delta XYZ`, or composite objective scoring;
 - configuration backup and automatic restoration;
 - CSV output for all trial results.
+
+GPU monitoring uses `nvidia-smi`. If an NVIDIA GPU or this command is unavailable, the trial continues; GPU metrics are reported as `unavailable` and the corresponding CSV fields remain empty.
 
 ## Requirements
 
@@ -185,7 +188,7 @@ euroc_config.yaml.backup_vins_tune_YYYYMMDD_HHMMSS
 
 By default, the original configuration is restored when the program finishes or is stopped. Add `--keep-best` to leave the best value found in the YAML file.
 
-Results are saved to `vins_param_tune_results.csv`. Use `--csv` to select another path.
+Results are saved to `vins_param_tune_results.csv`. Use `--csv` to select another path. Both the CSV file and console report include minimum, maximum, and average CPU/GPU utilization percentages for every result.
 
 ## Controlling execution
 

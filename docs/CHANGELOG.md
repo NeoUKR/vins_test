@@ -1,3 +1,9 @@
+Changes in 4.1.0:
+  - monitor total CPU and NVIDIA GPU utilization during each tuning trial
+  - add minimum, maximum, and average CPU/GPU load to trial reports
+  - add CPU/GPU load statistics to CSV output and repeated-trial aggregation
+  - continue testing when GPU monitoring is unavailable
+
 Changes in 4.0.1:
   - remove the version number from the script filename and ROS node name
   - add --version output with application version, Git branch, and ROS version
