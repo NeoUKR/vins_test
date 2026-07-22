@@ -23,7 +23,7 @@ python3 vins_test.py --version
 - configuration backup and automatic restoration;
 - CSV output for all trial results.
 
-GPU monitoring first uses a Linux DRM utilization counter from sysfs when the driver provides one, with `nvidia-smi` as the NVIDIA fallback. If the driver exposes no supported source, the trial continues; GPU metrics are reported as `unavailable` and the corresponding CSV fields remain empty.
+On Raspberry Pi, the utility reads accumulated V3D queue runtime from `gpu_stats`, calculates utilization from consecutive samples, and uses the busiest queue as overall GPU load. Other DRM drivers can use `gpu_busy_percent`/`gt_busy_percent`, with `nvidia-smi` as the NVIDIA fallback. If the driver exposes no supported source, the trial continues; GPU metrics are reported as `unavailable` and the corresponding CSV fields remain empty.
 
 ## Requirements
 

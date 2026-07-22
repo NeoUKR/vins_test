@@ -1,3 +1,8 @@
+Changes in 4.1.3:
+  - calculate Raspberry Pi V3D GPU load from gpu_stats runtime deltas
+  - discover the V3D gpu_stats file through bounded, symlink-safe sysfs paths
+  - report the busiest V3D queue as overall GPU utilization
+
 Changes in 4.1.2:
   - use one MeasurementSession implementation for tuning and standalone tests
   - include CPU/GPU min, max, and average load in standalone reports

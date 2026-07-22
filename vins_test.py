@@ -52,7 +52,7 @@ from typing import List, Optional, Tuple
 from collections import deque
 
 APP_NAME = "VINS Test"
-VERSION = "4.1.2"
+VERSION = "4.1.3"
 
 ROS_VERSION = 1 if "--ros1" in sys.argv else 2
 ROS_NODE = None
@@ -245,13 +245,23 @@ class TrialResult:
 
 
 class ResourceMonitor:
-    """Sample total CPU and NVIDIA GPU utilization in a background thread."""
+    """Sample total CPU and GPU utilization in a background thread."""
+
+    V3D_GPU_STATS_PATTERNS = (
+        "/sys/bus/platform/drivers/v3d/*/gpu_stats",
+        "/sys/bus/platform/devices/*v3d*/gpu_stats",
+        "/sys/devices/platform/*v3d*/gpu_stats",
+        "/sys/devices/platform/*/*v3d*/gpu_stats",
+        "/sys/devices/platform/*/*/*v3d*/gpu_stats",
+    )
 
     def __init__(self, interval: float = 1.0):
         self.interval = interval
         self.cpu_samples: List[float] = []
         self.gpu_samples: List[float] = []
         self._previous_cpu = None
+        self._v3d_gpu_stats_path = self._find_v3d_gpu_stats()
+        self._previous_v3d_stats = None
         self._stop_event = threading.Event()
         self._thread = None
         self._lock = threading.Lock()
@@ -283,9 +293,55 @@ class ResourceMonitor:
             return None
         return max(0.0, min(100.0, 100.0 * (total_delta - idle_delta) / total_delta))
 
+    @classmethod
+    def _find_v3d_gpu_stats(cls):
+        for pattern in cls.V3D_GPU_STATS_PATTERNS:
+            for path in glob.glob(pattern):
+                real_path = os.path.realpath(path)
+                if os.path.isfile(real_path) and os.access(real_path, os.R_OK):
+                    return real_path
+        return None
+
     @staticmethod
-    def _sample_gpu():
-        # Prefer a driver-provided Linux DRM utilization counter when present.
+    def _read_v3d_gpu_stats(path):
+        """Return V3D queue counters as {queue: (timestamp_ns, runtime_ns)}."""
+        counters = {}
+        try:
+            with open(path, "r", encoding="ascii") as f:
+                for line in f:
+                    fields = line.split()
+                    if not fields or fields[0].lower() == "queue" or len(fields) < 4:
+                        continue
+                    counters[fields[0]] = (int(fields[1]), int(fields[3]))
+        except (OSError, ValueError):
+            return None
+        return counters or None
+
+    def _sample_v3d_gpu(self):
+        current = self._read_v3d_gpu_stats(self._v3d_gpu_stats_path)
+        if current is None:
+            return None
+        previous, self._previous_v3d_stats = self._previous_v3d_stats, current
+        if previous is None:
+            return None
+
+        queue_loads = []
+        for queue in previous.keys() & current.keys():
+            timestamp_delta = current[queue][0] - previous[queue][0]
+            runtime_delta = current[queue][1] - previous[queue][1]
+            if timestamp_delta > 0 and runtime_delta >= 0:
+                queue_loads.append(
+                    max(0.0, min(100.0, 100.0 * runtime_delta / timestamp_delta))
+                )
+        # V3D queues may overlap. The busiest queue is used as overall load,
+        # matching the verified Raspberry Pi 5 diagnostic implementation.
+        return max(queue_loads) if queue_loads else None
+
+    def _sample_gpu(self):
+        if self._v3d_gpu_stats_path is not None:
+            return self._sample_v3d_gpu()
+
+        # Generic DRM counters used by some non-V3D drivers.
         sysfs_values = []
         for pattern in (
             "/sys/class/drm/card*/device/gpu_busy_percent",
